@@ -102,7 +102,7 @@ Las siglas **CI/CD** agrupan prácticas diferentes:
 | --- | --- | --- |
 | Integración continua (*Continuous Integration*) | ¿Este cambio puede integrarse sin romper el sistema? | Build y pruebas aprobados o rechazados. |
 | Entrega continua (*Continuous Delivery*) | ¿Existe una versión validada y lista para publicar? | Artefacto desplegable, con publicación de Production todavía aprobada manualmente. |
-| Despliegue continuo (*Continuous Deployment*) | ¿Todo cambio que supera los controles debe llegar automáticamente a Production? | Publicación automática después de las puertas de calidad. |
+
 
 CI no significa solamente “usar un servidor de CI”. Es una práctica de integrar cambios pequeños y frecuentes, verificarlos automáticamente y obtener retroalimentación rápida. CD extiende esa práctica hasta la preparación o publicación del software.
 
@@ -118,7 +118,7 @@ Su modelo tiene las siguientes piezas:
 | --- | --- | --- |
 | Evento | Hecho que puede iniciar una automatización. | `pull_request`, `push`, ejecución manual. |
 | Workflow | Proceso automatizado completo, definido en YAML. | Validar y desplegar en Vercel. |
-| Job | Grupo de pasos que se ejecuta en un runner. | `validate-and-deploy`. |
+| Job | Grupo de pasos que se ejecuta en un runner. | `ci`, `preview` o `production`. |
 | Step | Unidad secuencial dentro de un job. | Ejecutar `npm test`. |
 | Action | Componente reutilizable que encapsula una tarea. | `actions/checkout` descarga el repositorio. |
 | Runner | Máquina que ejecuta un job. | Una VM temporal con Ubuntu. |
@@ -276,26 +276,31 @@ Ya definidos los conceptos, podemos asignar responsabilidades concretas:
 | GitHub Actions | Orquesta validación, build y deploy a partir de eventos. | No aloja permanentemente la aplicación. |
 | Vercel | Ejecuta la API, conserva deployments y administra dominios. | No reemplaza las pruebas ni la revisión de código. |
 
-La implementación elegida usa un único workflow con comportamiento condicional: los pull requests generan Preview y los pushes a `master` generan Production.
+La implementación elegida usa un único workflow con tres jobs. `ci` valida todos los cambios; después, según el evento, `preview` publica los pull requests y `production` publica los cambios de `master`. Los jobs de despliegue declaran `needs: ci`, por lo que GitHub no los inicia si falla una puerta de calidad.
 
 ```mermaid
 flowchart LR
     DEV[Desarrollador] -->|push o pull request| GH[(Repositorio GitHub)]
     GH -->|evento| GA[GitHub Actions]
 
-    subgraph RUNNER[Runner temporal]
+    subgraph CI[Job ci · runner temporal]
         direction TB
         I[npm ci] --> T[typecheck]
         T --> U[tests]
-        U --> P[vercel pull]
+    end
+
+    subgraph DEPLOY[Job de despliegue · otro runner]
+        direction TB
+        C[checkout + npm ci] --> P[vercel pull]
         P --> B[vercel build]
         B --> D[deploy prebuilt]
     end
 
-    GA --> RUNNER
+    GA --> CI
+    U -->|needs: ci| DEPLOY
     D --> V[Vercel]
-    V --> PRE[Preview por PR]
-    V --> PROD[Production desde master]
+    V -->|pull request| PRE[Preview]
+    V -->|push a master| PROD[Production]
 
     classDef github fill:#f6f8fa,stroke:#24292f,color:#24292f
     classDef vercel fill:#24292f,stroke:#24292f,color:#ffffff
@@ -307,7 +312,7 @@ flowchart LR
     class PROD production
 ```
 
-El principio clave es **promover código verificado**: si los tipos o las pruebas fallan, los pasos de Vercel no se ejecutan.
+El principio clave es **promover código verificado**: si los tipos o las pruebas fallan, los jobs de Vercel no se ejecutan. Cada job recibe un runner limpio; por eso `preview` y `production` vuelven a descargar el repositorio e instalar dependencias en lugar de asumir que conservan los archivos de `ci`.
 
 ### 4.1 Decisiones de diseño y alternativas
 
@@ -623,9 +628,32 @@ permissions:
   contents: read
 
 jobs:
-  deploy:
-    # Un dispatch manual solo puede desplegar si se eligió master.
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias reproducibles
+        run: npm ci
+
+      - name: Verificar tipos
+        run: npm run typecheck
+
+      - name: Ejecutar pruebas
+        run: npm test
+
+  preview:
+    if: github.event_name == 'pull_request'
+    needs: ci
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -659,37 +687,64 @@ jobs:
       - name: Instalar dependencias reproducibles
         run: npm ci
 
-      - name: Verificar tipos
-        run: npm run typecheck
-
-      - name: Ejecutar pruebas
-        run: npm test
-
       - name: Instalar la CLI de Vercel
         run: npm install --global vercel@latest
 
       - name: Obtener configuración Preview
-        if: github.event_name == 'pull_request'
         run: vercel pull --yes --environment=preview --token="$VERCEL_TOKEN"
 
       - name: Construir Preview
-        if: github.event_name == 'pull_request'
         run: vercel build --token="$VERCEL_TOKEN"
 
       - name: Desplegar Preview
-        if: github.event_name == 'pull_request'
         run: vercel deploy --prebuilt --token="$VERCEL_TOKEN"
 
+  production:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+    steps:
+      - name: Validar secrets requeridos
+        shell: bash
+        run: |
+          missing=()
+          [ -z "$VERCEL_TOKEN" ] && missing+=(VERCEL_TOKEN)
+          [ -z "$VERCEL_ORG_ID" ] && missing+=(VERCEL_ORG_ID)
+          [ -z "$VERCEL_PROJECT_ID" ] && missing+=(VERCEL_PROJECT_ID)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Faltan GitHub Actions secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias reproducibles
+        run: npm ci
+
+      - name: Instalar la CLI de Vercel
+        run: npm install --global vercel@latest
+
       - name: Obtener configuración Production
-        if: github.event_name != 'pull_request'
         run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
 
       - name: Construir Production
-        if: github.event_name != 'pull_request'
         run: vercel build --prod --token="$VERCEL_TOKEN"
 
       - name: Desplegar Production
-        if: github.event_name != 'pull_request'
         run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
 ```
 
@@ -697,9 +752,12 @@ jobs:
 
 - `on.pull_request`: crea Preview para cambios dirigidos a `master`.
 - `on.push`: publica Production después de que el cambio llega a `master`.
-- `workflow_dispatch`: permite una ejecución manual desde la pestaña Actions. El `if` del job impide desplegar desde otra rama; para publicar hay que seleccionar `master`.
+- `workflow_dispatch`: permite una ejecución manual desde la pestaña Actions. La condición de `production` impide desplegar desde otra rama; para publicar hay que seleccionar `master`.
 - `concurrency`: cancela un despliegue viejo de la misma referencia si llega otro commit.
 - `permissions: contents: read`: aplica privilegio mínimo al token automático de GitHub.
+- `ci`: instala dependencias y ejecuta las dos puertas de calidad para todos los eventos.
+- `needs: ci`: crea una dependencia explícita. `preview` o `production` solo pueden comenzar cuando `ci` termina correctamente.
+- `if` en cada job de despliegue: selecciona `preview` para un pull request y `production` para un push o una ejecución manual sobre `master`. El job que no corresponde aparece como omitido (*skipped*).
 - `checkout`: copia el commit exacto dentro del runner.
 - `setup-node`: fija Node y reutiliza la caché de npm. La caché acelera descargas, pero `npm ci` sigue instalando y validando dependencias.
 - `typecheck` y `test`: son las puertas de calidad.
@@ -708,9 +766,15 @@ jobs:
 - `vercel deploy --prebuilt`: publica ese artefacto sin reconstruirlo de manera diferente.
 - `--prod`: selecciona configuración y alias de producción. Debe aparecer tanto en `build` como en `deploy` para Production.
 
+### ¿Por qué se repiten `checkout`, `setup-node` y `npm ci`?
+
+Cada job se ejecuta en un runner nuevo y aislado. Cuando termina `ci`, su directorio de trabajo desaparece y `preview` o `production` no heredan sus archivos ni sus dependencias instaladas. Por eso cada job de despliegue prepara su propio entorno. Si fuera necesario transferir un resultado entre jobs, habría que publicarlo y descargarlo como un *artifact*; en este ejemplo se repite una preparación breve para mantener visible la independencia entre runners.
+
+La separación también reduce la exposición de credenciales: `ci` no declara secretos de Vercel. Solo el job de despliegue elegido por el evento recibe `VERCEL_TOKEN`, `VERCEL_ORG_ID` y `VERCEL_PROJECT_ID`.
+
 Usar `vercel@latest` facilita una clase inicial, pero un proyecto real debería fijar una versión revisada para que una actualización futura de la CLI no cambie el pipeline inesperadamente, por ejemplo `npm install --global vercel@50.1.0`.
 
-### Dos recorridos, un mismo workflow
+### Dos recorridos, tres jobs en un mismo workflow
 
 ```mermaid
 sequenceDiagram
@@ -723,14 +787,16 @@ sequenceDiagram
     alt Pull request hacia master
         Dev->>GH: push a rama y abre PR
         GH->>GA: evento pull_request
-        GA->>GA: npm ci + typecheck + tests
-        GA->>VE: build y deploy Preview
+        GA->>GA: job ci: npm ci + typecheck + tests
+        GA->>GA: needs: ci habilita job preview
+        GA->>VE: job preview: build y deploy
         VE-->>GA: URL única de Preview
     else Push a master
         Dev->>GH: merge aprobado
         GH->>GA: evento push
-        GA->>GA: npm ci + typecheck + tests
-        GA->>VE: build --prod y deploy --prod
+        GA->>GA: job ci: npm ci + typecheck + tests
+        GA->>GA: needs: ci habilita job production
+        GA->>VE: job production: build --prod y deploy --prod
         VE-->>GA: Production actualizada
     end
 ```
@@ -749,7 +815,9 @@ git commit -m "Probar despliegue preview"
 git push -u origin practica/preview-vercel
 ```
 
-Abrir un pull request hacia `master`. En GitHub, entrar a **Actions**, abrir la ejecución y observar cada paso. Al finalizar, el paso `Desplegar Preview` muestra una URL de despliegue.
+Abrir un pull request hacia `master`. En GitHub, entrar a **Actions** y abrir la ejecución. El gráfico muestra tres jobs: `ci` se ejecuta primero, `preview` espera su resultado y `production` queda omitido porque el evento es un pull request. Si `typecheck` o las pruebas fallan, `preview` no comienza; al corregir el cambio, la siguiente ejecución vuelve a recorrer la dependencia.
+
+Cuando `ci` termina correctamente, abrir el job `preview`. Allí se puede observar que usa un runner diferente, prepara nuevamente el proyecto y recién después ejecuta Vercel. Al finalizar, el paso `Desplegar Preview` muestra una URL única asociada a ese cambio. Esa URL permite revisar la versión propuesta sin reemplazar Production.
 
 Probar la URL reemplazando `<URL_PREVIEW>`:
 
@@ -847,7 +915,7 @@ La cadena de suministro de software incluye código, dependencias, actions, runn
 - Mantener dependencias actualizadas y revisar alertas de seguridad.
 - No almacenar estado de partidas en memoria de la función; usar un servicio durable si el diseño futuro lo requiere.
 
-Una evolución recomendable es separar los jobs `ci`, `preview` y `production`, usar ambientes GitHub `preview`/`production` y agregar aprobación obligatoria al segundo. Esta guía los mantiene unidos para que el flujo inicial resulte visible de punta a punta.
+Los jobs `ci`, `preview` y `production` ya separan validación y despliegues. Una evolución recomendable es sumar ambientes GitHub `preview`/`production`, secretos diferentes y aprobación obligatoria para Production.
 
 ## 15. Recuperación: rollback
 
