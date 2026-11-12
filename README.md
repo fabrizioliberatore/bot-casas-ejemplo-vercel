@@ -216,3 +216,5 @@ y el arranque en `src/server.ts`.
 
 El diccionario de direcciones sigue el formato solicitado para este bot; difiere
 del objeto `{pieceId, direction}` mostrado en el PDF de la clase.
+
+Validación de entorno Preview
