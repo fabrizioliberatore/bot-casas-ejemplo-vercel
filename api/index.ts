@@ -1,5 +1,5 @@
 import { app } from "../src/app.js";
 
-// Vercel convierte este export en una Function serverless.
-// No llamamos a app.listen(): el runtime administra el servidor HTTP.
+// Vercel invoca esta aplicación ante cada solicitud HTTP.
+// No usamos app.listen: Vercel administra el servidor y el puerto.
 export default app;
